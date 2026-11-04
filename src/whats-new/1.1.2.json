@@ -1,0 +1,12 @@
+{
+  "version": "1.1.2",
+  "items": [
+    {
+      "type": "improve",
+      "zh": "简化侧栏为 Claude、Codex 图标入口；移除工作台介绍区，点击软件 Logo 返回工作台。",
+      "zh-TW": "簡化側欄為 Claude、Codex 圖示入口；移除工作台介紹區，點擊軟體 Logo 返回工作台。",
+      "en": "Simpler app icons, a compact workspace and a clickable home logo.",
+      "ja": "アプリアイコンを簡素化し、紹介エリアを削除。ロゴからホームに戻れます。"
+    }
+  ]
+}

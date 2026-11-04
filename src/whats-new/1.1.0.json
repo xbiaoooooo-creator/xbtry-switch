@@ -1,0 +1,26 @@
+{
+  "version": "1.1.0",
+  "items": [
+    {
+      "type": "new",
+      "zh": "全新简约工作台，统一所有功能入口，不再区分轻量或高级模式。",
+      "zh-TW": "全新简约工作台，统一所有功能入口，不再区分轻量或高级模式。",
+      "en": "A new minimal workspace with one interface for every feature.",
+      "ja": "A new minimal workspace with one interface for every feature."
+    },
+    {
+      "type": "improve",
+      "zh": "密钥导入支持多应用选择、默认隐藏密钥和失败重试。",
+      "zh-TW": "密钥导入支持多应用选择、默认隐藏密钥和失败重试。",
+      "en": "Connect multiple apps with a masked API key and retry only failed imports.",
+      "ja": "Connect multiple apps with a masked API key and retry only failed imports."
+    },
+    {
+      "type": "improve",
+      "zh": "统计、会话、设置和脚本编辑按需加载。",
+      "zh-TW": "统计、会话、设置和脚本编辑按需加载。",
+      "en": "Usage, sessions, settings and script editing load on demand.",
+      "ja": "Usage, sessions, settings and script editing load on demand."
+    }
+  ]
+}
