@@ -1,0 +1,48 @@
+name: Build macOS universal DMG
+on:
+  push:
+    paths:
+      - 'xbtry-macos-build-source.zip'
+      - '.github/workflows/macos-build.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Extract application source
+        run: unzip -q xbtry-macos-build-source.zip -d app
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.12.3
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: app/.node-version
+          cache: pnpm
+          cache-dependency-path: app/pnpm-lock.yaml
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.95'
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: app/src-tauri -> target
+      - name: Install frontend dependencies
+        working-directory: app
+        run: pnpm install --frozen-lockfile
+      - name: Build universal app and DMG
+        working-directory: app
+        env:
+          APPLE_SIGNING_IDENTITY: '-'
+        run: >-
+          pnpm tauri build --target universal-apple-darwin --bundles app dmg
+          --config '{"bundle":{"createUpdaterArtifacts":false}}'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: XBTry-1.1.2-macOS-universal
+          path: app/src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+          if-no-files-found: error
+          retention-days: 14
