@@ -2,6 +2,7 @@ name: Build XBTry Connect macOS DMG
 on:
   push:
     branches: [xbtry-connect-2.1.0]
+  workflow_dispatch:
 permissions:
   contents: read
 jobs:
@@ -21,10 +22,44 @@ jobs:
           workspaces: src-tauri -> target
       - name: Install Tauri CLI
         run: npm install --no-save @tauri-apps/cli@2.10.1
-      - name: Build universal app and DMG (ad-hoc signed)
+      # With Apple Developer secrets: Developer ID signing + notarization (no Gatekeeper warning).
+      # Without them: ad-hoc signing (users must allow the app once).
+      - name: Configure signing
+        shell: bash
         env:
-          APPLE_SIGNING_IDENTITY: '-'
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          if [ -n "$APPLE_CERTIFICATE" ]; then
+            {
+              echo "APPLE_CERTIFICATE=$APPLE_CERTIFICATE"
+              echo "APPLE_CERTIFICATE_PASSWORD=$APPLE_CERTIFICATE_PASSWORD"
+              echo "APPLE_SIGNING_IDENTITY=$APPLE_SIGNING_IDENTITY"
+              echo "APPLE_ID=$APPLE_ID"
+              echo "APPLE_PASSWORD=$APPLE_PASSWORD"
+              echo "APPLE_TEAM_ID=$APPLE_TEAM_ID"
+            } >> "$GITHUB_ENV"
+            echo "Developer ID signing + notarization enabled."
+          else
+            echo "APPLE_SIGNING_IDENTITY=-" >> "$GITHUB_ENV"
+            echo "No Apple certificate; ad-hoc signing."
+          fi
+      - name: Build universal app and DMG
         run: npx tauri build --target universal-apple-darwin --bundles app,dmg
+      - name: Verify signature
+        shell: bash
+        run: |
+          APP=src-tauri/target/universal-apple-darwin/release/bundle/macos/XBTry.app
+          lipo -archs "$APP/Contents/MacOS/XBTry"
+          codesign -dv --verbose=2 "$APP" 2>&1
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          spctl -a -vvv -t exec "$APP" 2>&1 || true
+          DMG=$(ls src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg)
+          hdiutil verify "$DMG"
       - uses: actions/upload-artifact@v4
         with:
           name: XBTry-2.1.0-macOS-universal
