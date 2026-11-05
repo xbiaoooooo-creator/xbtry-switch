@@ -261,32 +261,84 @@ function reset() {
 }
 
 // ---------- restore dialog ----------
+const TARGETS = ["codex", "claude"];
+const pad = (n) => String(n).padStart(2, "0");
+const fmtTime = (ms) => { const d = new Date(ms); return `${d.getMonth() + 1}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`; };
+const restorable = (t) => !!state.status[t]?.has_backup || (state.history?.[t]?.length ?? 0) > 0;
+
+async function loadHistory() {
+  state.history = {};
+  for (const t of TARGETS) {
+    try { state.history[t] = await invoke("list_history", { target: t }); } catch { state.history[t] = []; }
+  }
+}
+
 async function openRestore() {
   await refreshStatus();
+  await loadHistory();
   const sel = $("#rdTarget");
-  const opts = ["codex", "claude"].map((t) => {
-    const o = new Option(NAMES[t] + (state.status[t]?.has_backup ? "" : "（无备份）"), t);
-    o.disabled = !state.status[t]?.has_backup;
+  const opts = TARGETS.map((t) => {
+    const o = new Option(NAMES[t] + (restorable(t) ? "" : "（无记录）"), t);
+    o.disabled = !restorable(t);
     return o;
   });
   sel.replaceChildren(...opts);
-  const first = opts.find((o) => !o.disabled);
-  if (first) sel.value = first.value;
-  $("#rdGo").disabled = !first;
-  $("#rdMsg").textContent = first ? "" : "还没有导入过，无需恢复。";
+  const first = opts.find((o) => !o.disabled && o.value === state.client) ?? opts.find((o) => !o.disabled) ?? opts[0];
+  sel.value = first.value;
+  $("#rdMsg").textContent = "";
   $("#rdMsg").className = "msg";
+  renderRestoreList();
   $("#restoreDlg").showModal();
+}
+
+// Options: the pre-XBTry original (if backed up) + every earlier import.
+function renderRestoreList() {
+  const t = $("#rdTarget").value;
+  const st = state.status[t];
+  const items = [];
+  if (st?.has_backup) items.push({ value: "backup", title: "导入前的原配置", sub: "撤回 XBTry 的全部修改" });
+  (state.history?.[t] ?? []).forEach((h, i) => {
+    const current = i === 0 && !!st?.connected && st.model === h.model && st.key_hint === h.key_hint;
+    let sub = `${fmtTime(h.time)} 导入 · 密钥 ${h.key_hint}`;
+    if (t === "codex" && h.model_count) sub += ` · ${h.model_count} 个可选模型`;
+    items.push({ value: h.id, title: h.model, sub, current });
+  });
+  const box = $("#rdList");
+  const legend = el("legend", "", "恢复到");
+  if (!items.length) {
+    box.replaceChildren(legend, el("p", "rd-empty", "还没有导入过，无需恢复。"));
+  } else {
+    box.replaceChildren(legend, ...items.map((it) => {
+      const lab = el("label", "rd-item");
+      const r = el("input"); r.type = "radio"; r.name = "rdPick"; r.value = it.value; r.disabled = !!it.current;
+      const txt = el("span");
+      const b = el("b", "", it.title);
+      if (it.current) b.append(el("em", "rd-cur", "当前"));
+      txt.append(b, el("small", "", it.sub));
+      lab.append(r, txt);
+      return lab;
+    }));
+    const pick = box.querySelector('input[name="rdPick"]:not(:disabled)');
+    if (pick) pick.checked = true;
+  }
+  $("#rdGo").disabled = !box.querySelector('input[name="rdPick"]:checked');
 }
 
 async function doRestore() {
   const target = $("#rdTarget").value;
+  const pick = $('input[name="rdPick"]:checked')?.value;
+  if (!pick) return;
   const m = $("#rdMsg");
+  $("#rdGo").disabled = true;
   try {
-    m.textContent = await invoke("restore_config", { target });
+    m.textContent = pick === "backup"
+      ? await invoke("restore_config", { target })
+      : await invoke("apply_history", { target, id: pick });
     m.className = "msg ok";
-    $("#rdGo").disabled = true;
   } catch (e) { m.textContent = String(e); m.className = "msg err"; }
-  refreshStatus();
+  await refreshStatus();
+  await loadHistory();
+  renderRestoreList();
 }
 
 // ---------- wiring ----------
@@ -298,6 +350,8 @@ $("#toneBtn").addEventListener("click", () => setTone(root.dataset.tone === "dar
 $("#openSite").addEventListener("click", () => T.opener.openUrl("https://xbtry.com"));
 $("#openRestore").addEventListener("click", openRestore);
 $("#rdGo").addEventListener("click", doRestore);
+$("#rdTarget").addEventListener("change", () => { $("#rdMsg").textContent = ""; renderRestoreList(); });
+$("#rdList").addEventListener("change", () => { $("#rdGo").disabled = !$('input[name="rdPick"]:checked'); });
 $("#filter").addEventListener("input", renderModels);
 $("#selAll").addEventListener("change", (e) => bulkPick(e.currentTarget.checked));
 $("#key").addEventListener("input", () => { invalidateFrom(1); render(); });

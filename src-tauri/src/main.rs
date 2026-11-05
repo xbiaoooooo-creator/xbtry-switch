@@ -17,7 +17,9 @@ fn main() {
             config::status,
             config::fetch_models,
             config::import_config,
-            config::restore_config
+            config::restore_config,
+            config::list_history,
+            config::apply_history
         ])
         .run(tauri::generate_context!())
         .expect("failed to start XBTry");

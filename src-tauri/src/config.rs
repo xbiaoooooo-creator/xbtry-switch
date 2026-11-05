@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const CLAUDE_BASE: &str = "https://api.xbtry.com";
 pub const CODEX_BASE: &str = "https://api.xbtry.com/v1";
@@ -411,6 +411,9 @@ pub fn import_config(req: ImportRequest) -> R<Vec<ImportResult>> {
     let mut out = Vec::new();
     if let Some(m) = clean(&req.claude_model) {
         let r = import_claude(key, &m);
+        if r.is_ok() {
+            let _ = record_history(Target::Claude, key, &m, &[]);
+        }
         out.push(ImportResult {
             target: Target::Claude,
             ok: r.is_ok(),
@@ -419,6 +422,9 @@ pub fn import_config(req: ImportRequest) -> R<Vec<ImportResult>> {
     }
     if let Some(m) = clean(&req.codex_model) {
         let r = import_codex(key, &m, &req.models);
+        if r.is_ok() {
+            let _ = record_history(Target::Codex, key, &m, &req.models);
+        }
         out.push(ImportResult {
             target: Target::Codex,
             ok: r.is_ok(),
@@ -429,6 +435,92 @@ pub fn import_config(req: ImportRequest) -> R<Vec<ImportResult>> {
         return Err("请至少选择一个客户端".into());
     }
     Ok(out)
+}
+
+// ---------- import history ----------
+// Every successful import is remembered so the restore dialog can switch
+// back to it. Re-applying runs the normal import, so it merges with the
+// user's current config instead of overwriting whole files.
+
+const HISTORY_MAX: usize = 10;
+
+#[derive(Serialize, Deserialize, Clone)]
+struct HistoryEntry {
+    id: String,
+    time: u64,
+    key: String,
+    model: String,
+    #[serde(default)]
+    models: Vec<String>,
+}
+
+/// What the UI sees: never the raw key.
+#[derive(Serialize)]
+pub struct HistoryItem {
+    id: String,
+    time: u64,
+    model: String,
+    model_count: usize,
+    key_hint: String,
+}
+
+fn history_path() -> R<PathBuf> {
+    Ok(home()?.join(".xbtry").join("history.json"))
+}
+
+fn history_of(all: &Map<String, Value>, t: Target) -> Vec<HistoryEntry> {
+    all.get(t.key())
+        .cloned()
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default()
+}
+
+fn record_history(t: Target, key: &str, model: &str, models: &[String]) -> R<()> {
+    let path = history_path()?;
+    let mut all = read_json_object(&path).unwrap_or_default();
+    let mut list = history_of(&all, t);
+    list.retain(|e| !(e.key == key && e.model == model && e.models == models));
+    let mut time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    while list.iter().any(|e| e.time == time) {
+        time += 1;
+    }
+    list.insert(0, HistoryEntry { id: time.to_string(), time, key: key.into(), model: model.into(), models: models.to_vec() });
+    list.truncate(HISTORY_MAX);
+    all.insert(t.key().into(), serde_json::to_value(&list).map_err(|e| e.to_string())?);
+    write_json(&path, &Value::Object(all))
+}
+
+#[tauri::command]
+pub fn list_history(target: Target) -> R<Vec<HistoryItem>> {
+    let all = read_json_object(&history_path()?)?;
+    Ok(history_of(&all, target)
+        .into_iter()
+        .map(|e| HistoryItem { model_count: e.models.len(), key_hint: mask(&e.key), id: e.id, time: e.time, model: e.model })
+        .collect())
+}
+
+#[tauri::command]
+pub fn apply_history(target: Target, id: String) -> R<String> {
+    let all = read_json_object(&history_path()?)?;
+    let e = history_of(&all, target)
+        .into_iter()
+        .find(|e| e.id == id)
+        .ok_or("这条导入记录已不存在，请重新打开窗口。")?;
+    let name = match target {
+        Target::Claude => {
+            import_claude(&e.key, &e.model)?;
+            "Claude Code"
+        }
+        Target::Codex => {
+            import_codex(&e.key, &e.model, &e.models)?;
+            "Codex"
+        }
+    };
+    let _ = record_history(target, &e.key, &e.model, &e.models);
+    Ok(format!("{name} 已切换回 {}（密钥 {}）", e.model, mask(&e.key)))
 }
 
 // ---------- status ----------
@@ -571,6 +663,21 @@ mod tests {
         assert!(!tmp.join(".claude.json").exists());
         assert_eq!(fs::read_to_string(tmp.join(".claude/settings.json")).unwrap(), orig_claude);
         assert!(restore_config(Target::Codex).is_err());
+
+        // History survives a restore and can re-apply an earlier import.
+        let h = list_history(Target::Claude).unwrap();
+        assert_eq!(h.len(), 2);
+        assert_eq!(h[0].model, "x");
+        assert_eq!(h[1].key_hint, "••••1234");
+        apply_history(Target::Claude, h[1].id.clone()).unwrap();
+        let s: Value = serde_json::from_str(&fs::read_to_string(tmp.join(".claude/settings.json")).unwrap()).unwrap();
+        assert_eq!(s["env"]["ANTHROPIC_AUTH_TOKEN"], "sk-test1234");
+        assert_eq!(s["env"]["ANTHROPIC_MODEL"], "gpt-6.1-sol");
+        assert_eq!(s["theme"], "dark", "re-apply merges, keeps user settings");
+        assert_eq!(list_history(Target::Claude).unwrap()[0].model, "gpt-6.1-sol");
+        assert!(has_backup(Target::Claude), "re-apply backs up the original first");
+        assert_eq!(list_history(Target::Codex).unwrap()[0].model_count, 2);
+        assert!(apply_history(Target::Codex, "nope".into()).is_err());
         let _ = fs::remove_dir_all(&tmp);
     }
 

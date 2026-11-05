@@ -107,12 +107,13 @@
 
 <dialog id="restoreDlg" aria-labelledby="rdTitle">
   <form method="dialog" class="dlg">
-    <h2 id="rdTitle">恢复原配置</h2>
-    <p class="muted">撤回 XBTry 的修改，回到第一次导入前的状态。请先完全退出对应客户端。</p>
+    <h2 id="rdTitle">恢复配置</h2>
+    <p class="muted">回到第一次导入前的原配置，或切换回之前导入过的某一次。请先完全退出对应客户端。</p>
     <div class="field">
       <label for="rdTarget">客户端</label>
       <select class="input" id="rdTarget"></select>
     </div>
+    <fieldset class="rd-list" id="rdList"></fieldset>
     <p class="msg" id="rdMsg"></p>
     <div class="dlg-act">
       <button class="btn ghost" value="cancel">取消</button>
