@@ -1,0 +1,33 @@
+name: Build XBTry Connect macOS DMG
+on:
+  push:
+    branches: [xbtry-connect-2.1.0]
+permissions:
+  contents: read
+jobs:
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+      - name: Install Tauri CLI
+        run: npm install --no-save @tauri-apps/cli@2.10.1
+      - name: Build universal app and DMG (ad-hoc signed)
+        env:
+          APPLE_SIGNING_IDENTITY: '-'
+        run: npx tauri build --target universal-apple-darwin --bundles app,dmg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: XBTry-2.1.0-macOS-universal
+          path: src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+          if-no-files-found: error
+          retention-days: 14

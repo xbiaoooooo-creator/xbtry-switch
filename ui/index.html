@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="zh-CN" data-mode="codex" data-tone="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>XBTry</title>
+<link rel="icon" href="logo.svg" type="image/svg+xml">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="app">
+  <!-- Left rail: the wizard steps. Clicking a finished step jumps back to it. -->
+  <nav class="rail" aria-label="配置步骤">
+    <svg class='mark' role='img' aria-label='XBTry' xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'><rect width="512" height="512" rx="114" fill="#0A0A0A"/><path d='M150 168L246 256L150 344' fill='none' stroke='#F5F5F5' stroke-width='58' stroke-linecap='round' stroke-linejoin='round'/><rect x='276' y='314' width='112' height='52' rx='12' fill='#E8732C'/></svg>
+    <ol class="steps" id="steps">
+      <li><button type="button" class="st" data-step="0"><i>1</i><span>客户端</span></button></li>
+      <li><button type="button" class="st" data-step="1"><i>2</i><span>API 密钥</span></button></li>
+      <li><button type="button" class="st" data-step="2"><i>3</i><span>选择模型</span></button></li>
+      <li><button type="button" class="st" data-step="3"><i>4</i><span>确认导入</span></button></li>
+    </ol>
+    <div class="ver">v2.1</div>
+  </nav>
+
+  <div class="main">
+    <!-- Top bar: global actions only, never navigation. -->
+    <header class="top">
+      <div class="brand"><svg class='logo' aria-hidden='true' xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'><rect width="512" height="512" rx="114" fill="#0A0A0A"/><path d='M150 168L246 256L150 344' fill='none' stroke='#F5F5F5' stroke-width='58' stroke-linecap='round' stroke-linejoin='round'/><rect x='276' y='314' width='112' height='52' rx='12' fill='#E8732C'/></svg><b>XB<span>Try</span></b><small id="modeName">CONNECT</small></div>
+      <div class="acct">
+        <button class="btn ghost sm" type="button" id="openRestore">恢复原配置</button>
+        <button class="ic" type="button" id="toneBtn" aria-label="切换深浅色">
+          <svg id="icMoon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z"/></svg>
+          <svg id="icSun" viewBox="0 0 24 24" aria-hidden="true" hidden><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+        </button>
+      </div>
+    </header>
+
+    <main class="panel" id="panel">
+      <!-- STEP 1 -->
+      <section class="pane" data-pane="0">
+        <p class="eyebrow">STEP 01 / 04</p>
+        <h1>选择要配置的客户端</h1>
+        <p class="lead">XBTry 会改写这个客户端在本机的配置，让它通过 api.xbtry.com 使用模型。</p>
+        <div class="clients" role="radiogroup" aria-label="客户端">
+          <label class="client" data-target="codex">
+            <input type="radio" name="client" value="codex">
+            <span class="dot"></span>
+            <b>Codex</b><small>OpenAI · 桌面版 / 终端 CLI</small>
+            <em class="state" data-state="codex"></em>
+          </label>
+          <label class="client" data-target="claude">
+            <input type="radio" name="client" value="claude">
+            <span class="dot"></span>
+            <b>Claude Code</b><small>Anthropic · 桌面版 / 终端 CLI</small>
+            <em class="state" data-state="claude"></em>
+          </label>
+        </div>
+        <p class="note">只配置当前 Windows 用户的本机客户端。网页版、手机端、WSL 和远程环境不读取这里的配置。</p>
+      </section>
+
+      <!-- STEP 2 -->
+      <section class="pane" data-pane="1" hidden>
+        <p class="eyebrow">STEP 02 / 04</p>
+        <h1>输入你的 API 密钥</h1>
+        <p class="lead">在 XBTry 后台复制密钥，粘贴到这里。下一步会用它读取你可用的模型。</p>
+        <div class="chips"><span>api.xbtry.com</span><span id="chipClient">Codex</span></div>
+        <div class="field">
+          <label for="key">API Key</label>
+          <div class="with-btn">
+            <input class="input" id="key" type="password" autocomplete="off" spellcheck="false" placeholder="sk-…">
+            <button class="btn ghost sm" type="button" id="toggleKey" aria-pressed="false">显示</button>
+          </div>
+        </div>
+        <p class="note">密钥只发送到 api.xbtry.com，并写入本机客户端配置。还没有密钥？<button class="link" type="button" id="openSite">去 XBTry 获取</button></p>
+      </section>
+
+      <!-- STEP 3 -->
+      <section class="pane" data-pane="2" hidden>
+        <p class="eyebrow">STEP 03 / 04</p>
+        <h1>选择模型</h1>
+        <p class="lead" id="modelLead"></p>
+        <div class="mtools">
+          <input class="input" id="filter" type="search" placeholder="搜索模型" aria-label="搜索模型">
+          <label class="bulk" id="bulk"><input type="checkbox" id="selAll"><span>全选</span></label>
+          <span class="muted" id="modelHint"></span>
+        </div>
+        <ul class="mlist" id="mlist" role="list"></ul>
+      </section>
+
+      <!-- STEP 4 -->
+      <section class="pane" data-pane="3" hidden>
+        <p class="eyebrow">STEP 04 / 04</p>
+        <h1 id="confirmTitle">确认并导入</h1>
+        <dl class="sum" id="sum"></dl>
+        <div class="result" id="result" hidden></div>
+        <p class="note" id="confirmNote">导入前会自动备份原配置，之后可以在右上角「恢复原配置」一键还原。</p>
+      </section>
+    </main>
+
+    <!-- Bottom action bar, like a desktop wizard. -->
+    <footer class="bar">
+      <span class="msg" id="msg" role="status" aria-live="polite"></span>
+      <button class="btn ghost" type="button" id="prev">上一步</button>
+      <button class="btn primary" type="button" id="next">下一步</button>
+    </footer>
+  </div>
+</div>
+
+<dialog id="restoreDlg" aria-labelledby="rdTitle">
+  <form method="dialog" class="dlg">
+    <h2 id="rdTitle">恢复原配置</h2>
+    <p class="muted">撤回 XBTry 的修改，回到第一次导入前的状态。请先完全退出对应客户端。</p>
+    <div class="field">
+      <label for="rdTarget">客户端</label>
+      <select class="input" id="rdTarget"></select>
+    </div>
+    <p class="msg" id="rdMsg"></p>
+    <div class="dlg-act">
+      <button class="btn ghost" value="cancel">取消</button>
+      <button class="btn primary" type="button" id="rdGo">恢复</button>
+    </div>
+  </form>
+</dialog>
+<script src="app.js"></script>
+</body>
+</html>
