@@ -133,10 +133,19 @@ async function loadModels() {
 }
 
 // ---------- step 3 ----------
+// Newest, plain (no date / thinking suffix) Claude model wins; opus > sonnet > haiku.
+function claudeScore(m) {
+  if (/\d{8}|thinking/i.test(m)) return -1;
+  const v = m.match(/(\d+)-(\d+)/);
+  return (v ? Number(v[1]) * 10 + Number(v[2]) : 0) * 10 + (/opus/i.test(m) ? 3 : /sonnet/i.test(m) ? 2 : /haiku/i.test(m) ? 1 : 0);
+}
+
 function pickDefault() {
   const t = state.client;
   const saved = store.get(`xbtry-model-${t}`, "");
-  const fam = state.models.find((m) => (t === "claude" ? isClaudeFamily(m) : /gpt|codex/i.test(m)));
+  const fam = t === "claude"
+    ? state.models.filter(isClaudeFamily).sort((a, b) => claudeScore(b) - claudeScore(a))[0]
+    : state.models.find((m) => /gpt|codex/i.test(m));
   state.def = state.models.includes(saved) ? saved : fam ?? state.models[0] ?? null;
   if (state.def) state.picked.add(state.def);
 }
@@ -145,7 +154,7 @@ function renderModels() {
   const codex = state.client === "codex";
   $("#modelLead").textContent = codex
     ? "勾选要出现在 Codex 模型菜单里的模型，并设一个默认。Claude 系模型同样可以在 Codex 中使用。"
-    : "选一个模型作为 Claude Code 的默认模型，后台的 haiku / sonnet / opus 请求也会统一使用它。GPT 系模型同样可用。";
+    : "选一个默认模型，终端、VS Code 和桌面版会一起配置。终端和 VS Code 也能用 GPT 系模型；桌面版只支持 Claude 系模型。";
   $("#modelHint").textContent = state.fallback ? "未能联网获取，显示的是默认列表"
     : codex ? `共 ${state.models.length} 个，已选 ${state.picked.size} 个` : `共 ${state.models.length} 个`;
   $("#bulk").hidden = !codex;
@@ -211,6 +220,7 @@ function renderSummary() {
     ["默认模型", state.def],
   ];
   if (state.client === "codex") rows.push(["可选模型", `${state.picked.size} 个`]);
+  if (state.client === "claude" && st?.also?.length) rows.push(["同时配置", st.also.join("、")]);
   rows.push(["写入位置", st?.config_path ?? "—"]);
   $("#sum").replaceChildren(...rows.flatMap(([k, v]) => [el("dt", "", k), el("dd", "", v)]));
   $("#confirmTitle").textContent = state.done ? "导入完成" : "确认并导入";
@@ -224,7 +234,7 @@ async function doImport() {
     key,
     claude_model: t === "claude" ? state.def : null,
     codex_model: t === "codex" ? state.def : null,
-    models: t === "codex" ? state.models.filter((m) => state.picked.has(m)) : [],
+    models: t === "codex" ? state.models.filter((m) => state.picked.has(m)) : state.models,
   };
   state.busy = true; render(); say("正在写入配置…");
   const box = $("#result");
@@ -237,7 +247,7 @@ async function doImport() {
       store.set(`xbtry-model-${t}`, state.def);
       box.replaceChildren(el("b", "", "✓ " + r.message));
       const ol = el("ol");
-      ol.append(el("li", "", `完全退出 ${NAMES[t]}（托盘里的也要退出）`), el("li", "", "重新打开，新建一个会话"), el("li", "", "发一条消息，确认能正常回复"));
+      ol.append(el("li", "", t === "claude" ? "完全退出 Claude 桌面版、VS Code 和终端（托盘里的也要退出）" : `完全退出 ${NAMES[t]}（托盘里的也要退出）`), el("li", "", "重新打开，新建一个会话"), el("li", "", "发一条消息，确认能正常回复"));
       box.append(ol);
       say("");
     } else {

@@ -4,6 +4,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::fs;
+use jsonc_parser::{cst::{CstInputValue, CstRootNode}, ParseOptions};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -136,27 +137,37 @@ fn has_backup(t: Target) -> bool {
         .unwrap_or(false)
 }
 
-/// Keep the state from *before* XBTry: once a backup exists, re-imports
-/// (e.g. a renewed key) never overwrite it.
-fn ensure_backup(t: Target) -> R<()> {
-    if has_backup(t) {
-        return Ok(());
-    }
+/// Keep the state from *before* XBTry: a file is backed up the first time
+/// XBTry is about to write it and never again, so re-imports keep the original.
+/// Files added in later versions (desktop, VS Code) join the same manifest.
+fn ensure_backup(t: Target, paths: &[PathBuf]) -> R<()> {
     let dir = backup_dir(t)?;
+    let manifest = dir.join("manifest.json");
+    let mut entries: Vec<BackupEntry> = match read_opt(&manifest)? {
+        Some(text) => serde_json::from_str(&text)
+            .map_err(|_| "备份记录已损坏，为避免丢失原配置已停止导入。".to_string())?,
+        None => Vec::new(),
+    };
+    let known = entries.len();
     fs::create_dir_all(&dir).map_err(|e| format!("创建备份目录失败：{e}"))?;
-    let mut entries = Vec::new();
-    for (i, path) in t.files()?.into_iter().enumerate() {
+    for path in paths {
+        if entries.iter().any(|e| &e.path == path) {
+            continue;
+        }
         let saved_as = if path.is_file() {
-            let name = format!("{i}-{}", path.file_name().unwrap_or_default().to_string_lossy());
-            fs::copy(&path, dir.join(&name)).map_err(|e| format!("备份 {} 失败：{e}", path.display()))?;
+            let name = format!("{}-{}", entries.len(), path.file_name().unwrap_or_default().to_string_lossy());
+            fs::copy(path, dir.join(&name)).map_err(|e| format!("备份 {} 失败：{e}", path.display()))?;
             Some(name)
         } else {
             None
         };
-        entries.push(BackupEntry { path, saved_as });
+        entries.push(BackupEntry { path: path.clone(), saved_as });
     }
-    let manifest = serde_json::to_value(&entries).map_err(|e| e.to_string())?;
-    write_json(&dir.join("manifest.json"), &manifest)
+    if entries.len() == known && manifest.is_file() {
+        return Ok(());
+    }
+    let value = serde_json::to_value(&entries).map_err(|e| e.to_string())?;
+    write_json(&manifest, &value)
 }
 
 #[tauri::command]
@@ -321,19 +332,249 @@ fn clean(s: &Option<String>) -> Option<String> {
     s.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string)
 }
 
-fn import_claude(key: &str, model: &str) -> R<()> {
+// ---------- Claude: CLI, VS Code extension, desktop app ----------
+// Layout follows SuperGPT Connect / CC Switch (both MIT): one import covers
+// every Claude entry point that is installed on this machine.
+
+/// Connection keys owned by the provider. They are cleared before writing so
+/// stale credentials, model pins or cloud routing from earlier tools can't win.
+const CLAUDE_FLOOR_ENV_PREFIXES: [&str; 3] = ["ANTHROPIC_", "AWS_", "VERTEX_REGION_"];
+const CLAUDE_PROTOCOL_SELECTORS: [&str; 7] = [
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "CLAUDE_CODE_USE_GATEWAY",
+    "CLAUDE_CODE_USE_MANTLE",
+    "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+    "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
+];
+const CLAUDE_FLOOR_ENV_KEYS: [&str; 9] = [
+    "CLAUDE_CODE_SUBAGENT_MODEL",
+    "CLAUDE_CODE_SUBAGENT_MODEL_FORCE",
+    "CLOUD_ML_REGION",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
+    "CLAUDE_CODE_OAUTH_SCOPES",
+    "CLAUDE_CODE_API_KEY_HELPER_TTL_MS",
+    "ENABLE_TOOL_SEARCH",
+];
+const CLAUDE_FLOOR_TOP: [&str; 13] = [
+    "apiKeyHelper", "apiBaseUrl", "primaryModel", "smallFastModel", "apiKey", "model",
+    "fallbackModel", "modelOverrides", "modelPicker", "advisorModel", "awsAuthRefresh",
+    "awsCredentialExport", "gcpAuthRefresh",
+];
+/// Written as empty strings: removing a JSON key does not unset a variable
+/// inherited from Windows/shell, an explicit empty value does.
+const CLAUDE_NEUTRALIZE: [&str; 5] = [
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_CUSTOM_HEADERS",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
+    "CLAUDE_CODE_OAUTH_SCOPES",
+];
+
+fn claude_floor_env(key: &str) -> bool {
+    CLAUDE_FLOOR_ENV_PREFIXES.iter().any(|p| key.starts_with(p))
+        || CLAUDE_PROTOCOL_SELECTORS.contains(&key)
+        || CLAUDE_FLOOR_ENV_KEYS.contains(&key)
+        || (key.starts_with("CLAUDE_CODE_SKIP_") && key.ends_with("_AUTH"))
+}
+
+const DESKTOP_PROFILE_ID: &str = "4b1f0c3e-8a2d-4e7b-9c51-6d0e2f7a9b13";
+
+/// Per-user app data roots (local, roaming). Under XBTRY_HOME they live inside
+/// it, so tests never touch the real desktop or VS Code settings.
+#[allow(unused_variables)]
+fn app_data() -> R<(PathBuf, PathBuf)> {
+    let home = home()?;
+    let sandbox = env_dir("XBTRY_HOME").is_some();
+    #[cfg(windows)]
+    {
+        let pick = |var: &str, sub: &str| {
+            if sandbox { home.join(sub) } else { env_dir(var).unwrap_or_else(|| home.join(sub)) }
+        };
+        return Ok((pick("LOCALAPPDATA", "AppData/Local"), pick("APPDATA", "AppData/Roaming")));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let d = home.join("Library/Application Support");
+        return Ok((d.clone(), d));
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let d = if sandbox { home.join(".config") } else { env_dir("XDG_CONFIG_HOME").unwrap_or_else(|| home.join(".config")) };
+        Ok((d.clone(), d))
+    }
+}
+
+/// [profile, library meta, 3p config, normal config]
+fn desktop_files() -> R<Vec<PathBuf>> {
+    let (local, _) = app_data()?;
+    let threep = local.join("Claude-3p");
+    Ok(vec![
+        threep.join("configLibrary").join(format!("{DESKTOP_PROFILE_ID}.json")),
+        threep.join("configLibrary").join("_meta.json"),
+        threep.join("claude_desktop_config.json"),
+        local.join("Claude").join("claude_desktop_config.json"),
+    ])
+}
+
+fn desktop_installed() -> bool {
+    app_data()
+        .map(|(local, _)| local.join("Claude").is_dir() || local.join("Claude-3p").is_dir())
+        .unwrap_or(false)
+}
+
+fn vscode_settings() -> R<PathBuf> {
+    Ok(app_data()?.1.join("Code").join("User").join("settings.json"))
+}
+
+fn vscode_installed() -> bool {
+    vscode_settings()
+        .map(|p| p.parent().is_some_and(Path::is_dir))
+        .unwrap_or(false)
+}
+
+/// The desktop model menu only accepts Claude family IDs.
+fn desktop_model_ok(id: &str) -> bool {
+    let lower = id.to_ascii_lowercase();
+    let id = lower.strip_prefix("anthropic/").unwrap_or(&lower);
+    ["claude-sonnet-", "claude-opus-", "claude-haiku-", "claude-fable-"]
+        .iter()
+        .any(|p| id.strip_prefix(p).is_some_and(|t| !t.is_empty() && !t.contains('[')))
+}
+
+/// Claude desktop: a separate third-party "gateway" profile, then switch the
+/// app into 3p mode. Other profiles, MCP servers and policies stay intact.
+fn import_desktop(key: &str, model: &str, models: &[String]) -> R<()> {
+    let files = desktop_files()?;
+    let (profile_p, meta_p, threep_p, main_p) = (&files[0], &files[1], &files[2], &files[3]);
+    // Read and validate everything first; write nothing if any file is broken.
+    let mut profile = read_json_object(profile_p)?;
+    let mut meta = read_json_object(meta_p)?;
+    let mut threep = read_json_object(threep_p)?;
+    let mut main = read_json_object(main_p)?;
+    let entries = meta
+        .entry("entries")
+        .or_insert(json!([]))
+        .as_array_mut()
+        .ok_or("Claude 桌面版配置目录格式无效，桌面版未修改。")?;
+    if entries.iter().any(|v| v.get("id").and_then(Value::as_str).is_none()) {
+        return Err("Claude 桌面版配置目录里有无法识别的条目，桌面版未修改。".into());
+    }
+    match entries.iter_mut().find(|v| v["id"] == DESKTOP_PROFILE_ID) {
+        Some(e) => e["name"] = json!("XBTry"),
+        None => entries.push(json!({ "id": DESKTOP_PROFILE_ID, "name": "XBTry" })),
+    }
+    meta.insert("appliedId".into(), json!(DESKTOP_PROFILE_ID));
+
+    let mut ordered = vec![model.to_string()];
+    ordered.extend(models.iter().filter(|m| *m != model && desktop_model_ok(m)).cloned());
+    for (k, v) in [
+        ("inferenceProvider", json!("gateway")),
+        ("inferenceGatewayBaseUrl", json!(CLAUDE_BASE)),
+        ("inferenceGatewayApiKey", json!(key)),
+        ("inferenceGatewayAuthScheme", json!("bearer")),
+        ("inferenceCredentialKind", json!("static")),
+        ("modelDiscoveryEnabled", json!(false)),
+        ("toolSearchEnabled", json!(false)),
+        ("inferenceModels", json!(ordered)),
+    ] {
+        profile.insert(k.into(), v);
+    }
+    for cfg in [&mut threep, &mut main] {
+        // Older third-party setups kept routing in enterpriseConfig; clear only those keys.
+        if let Some(Value::Object(e)) = cfg.get_mut("enterpriseConfig") {
+            for k in ["inferenceProvider", "inferenceGatewayBaseUrl", "inferenceGatewayApiKey", "inferenceGatewayAuthScheme"] {
+                e.remove(k);
+            }
+        }
+        cfg.insert("deploymentMode".into(), json!("3p"));
+    }
+    // Activate only after the credential and the library entry are in place.
+    write_json(profile_p, &Value::Object(profile))?;
+    write_json(meta_p, &Value::Object(meta))?;
+    write_json(threep_p, &Value::Object(threep))?;
+    write_json(main_p, &Value::Object(main))
+}
+
+fn jsonc_options() -> ParseOptions {
+    ParseOptions {
+        allow_comments: true,
+        allow_trailing_commas: true,
+        allow_loose_object_property_names: false,
+        allow_missing_commas: false,
+        allow_single_quoted_strings: false,
+        allow_hexadecimal_numbers: false,
+        allow_unary_plus_numbers: false,
+        allow_bare_decimal_point_numbers: false,
+        allow_non_finite_numbers: false,
+        allow_extended_string_escapes: false,
+    }
+}
+
+/// VS Code extension: it already reads ~/.claude/settings.json, it only needs
+/// the official sign-in screen turned off. The key is not copied into VS Code
+/// settings (Settings Sync would upload it). Comments and formatting are kept.
+fn import_vscode() -> R<()> {
+    let path = vscode_settings()?;
+    let before = read_opt(&path)?.unwrap_or_default();
+    let trimmed = before.trim_start_matches('\u{feff}');
+    let text = if trimmed.trim().is_empty() { "{}" } else { trimmed };
+    let opts = jsonc_options();
+    let doc: Value = jsonc_parser::parse_to_serde_value(text, &opts)
+        .map_err(|_| "VS Code 设置文件格式有误，VS Code 未修改。".to_string())?;
+    if !doc.is_object() {
+        return Err("VS Code 设置文件格式有误，VS Code 未修改。".into());
+    }
+    let root = CstRootNode::parse(text, &opts).map_err(|_| "无法解析 VS Code 设置，VS Code 未修改。".to_string())?;
+    let obj = root.object_value_or_set();
+    let k = "claudeCode.disableLoginPrompt";
+    if obj.properties().iter().filter(|p| p.decoded_name().as_deref() == Some(k)).count() > 1 {
+        return Err("VS Code 设置里有重复的 claudeCode.disableLoginPrompt，VS Code 未修改。".into());
+    }
+    if let Some(p) = obj.get(k) {
+        p.set_value(CstInputValue::Bool(true));
+    } else {
+        obj.append(k, CstInputValue::Bool(true));
+    }
+    write_atomic(&path, &root.to_string())
+}
+
+/// What else got configured besides the terminal CLI.
+#[derive(Default)]
+struct ClaudeExtras {
+    done: Vec<&'static str>,
+    warnings: Vec<String>,
+}
+
+fn import_claude(key: &str, model: &str, models: &[String]) -> R<ClaudeExtras> {
     let settings_path = claude_dir()?.join("settings.json");
     let mut settings = read_json_object(&settings_path)?;
     let state_path = home()?.join(".claude.json");
     let mut state = read_json_object(&state_path)?;
-    ensure_backup(Target::Claude)?;
+    let desktop = desktop_installed();
+    let desktop_ok = desktop && desktop_model_ok(model);
+    let vscode = vscode_installed();
+    let mut files = Target::Claude.files()?;
+    if desktop_ok {
+        files.extend(desktop_files()?);
+    }
+    if vscode {
+        files.push(vscode_settings()?);
+    }
+    ensure_backup(Target::Claude, &files)?;
 
     let mut env = match settings.remove("env") {
         Some(Value::Object(m)) => m,
         _ => Map::new(),
     };
-    // Two auth variables at once make Claude Code warn and pick one at random.
-    env.remove("ANTHROPIC_API_KEY");
+    env.retain(|k, _| !claude_floor_env(k));
+    settings.retain(|k, _| !CLAUDE_FLOOR_TOP.contains(&k.as_str()));
+    for k in CLAUDE_NEUTRALIZE.iter().chain(CLAUDE_PROTOCOL_SELECTORS.iter()) {
+        env.insert((*k).into(), json!(""));
+    }
     env.insert("ANTHROPIC_BASE_URL".into(), json!(CLAUDE_BASE));
     env.insert("ANTHROPIC_AUTH_TOKEN".into(), json!(key));
     // All aliases point at the chosen model, so a GPT model works too and
@@ -343,16 +584,51 @@ fn import_claude(key: &str, model: &str) -> R<()> {
         "ANTHROPIC_DEFAULT_HAIKU_MODEL",
         "ANTHROPIC_DEFAULT_SONNET_MODEL",
         "ANTHROPIC_DEFAULT_OPUS_MODEL",
+        "ANTHROPIC_DEFAULT_FABLE_MODEL",
         "ANTHROPIC_SMALL_FAST_MODEL",
     ] {
         env.insert(k.into(), json!(model));
     }
+    // Gateway compatibility switches from the Claude Code docs.
+    env.insert("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC".into(), json!("1"));
+    env.insert("CLAUDE_CODE_AUTO_MODE_SERVER".into(), json!("0"));
+    env.insert("ENABLE_TOOL_SEARCH".into(), json!("false"));
     settings.insert("env".into(), Value::Object(env));
+    settings.insert("model".into(), json!(model));
+    if !models.is_empty() {
+        let mut list = vec![model.to_string()];
+        list.extend(models.iter().filter(|m| *m != model).cloned());
+        let options: Vec<Value> = list
+            .iter()
+            .map(|m| json!({ "model": m, "label": m, "description": "通过 XBTry 调用" }))
+            .collect();
+        settings.insert("modelPicker".into(), json!({ "replaceBuiltInOptions": true, "options": options }));
+        settings.insert("availableModels".into(), json!(list));
+    }
     write_json(&settings_path, &Value::Object(settings))?;
 
     // Skip the first-run login screen; the token above is the login.
     state.insert("hasCompletedOnboarding".into(), json!(true));
-    write_json(&state_path, &Value::Object(state))
+    write_json(&state_path, &Value::Object(state))?;
+
+    let mut extras = ClaudeExtras::default();
+    if vscode {
+        match import_vscode() {
+            Ok(()) => extras.done.push("VS Code 插件"),
+            Err(e) => extras.warnings.push(e),
+        }
+    }
+    if desktop {
+        if !desktop_ok {
+            extras.warnings.push("Claude 桌面版只支持 claude-opus / sonnet / haiku 系模型，这次没有配置桌面版".into());
+        } else {
+            match import_desktop(key, model, models) {
+                Ok(()) => extras.done.push("Claude 桌面版"),
+                Err(e) => extras.warnings.push(e),
+            }
+        }
+    }
+    Ok(extras)
 }
 
 fn import_codex(key: &str, model: &str, models: &[String]) -> R<()> {
@@ -363,7 +639,7 @@ fn import_codex(key: &str, model: &str, models: &[String]) -> R<()> {
         .trim_start_matches('\u{feff}')
         .parse()
         .map_err(|_| format!("{} 格式有误，为避免覆盖你的配置已停止。", config_path.display()))?;
-    ensure_backup(Target::Codex)?;
+    ensure_backup(Target::Codex, &Target::Codex.files()?)?;
 
     // Catalog: chosen model first, then everything else from the relay.
     let mut slugs = vec![model.to_string()];
@@ -399,6 +675,17 @@ fn import_codex(key: &str, model: &str, models: &[String]) -> R<()> {
     write_json(&dir.join("auth.json"), &json!({ "OPENAI_API_KEY": key }))
 }
 
+fn claude_message(model: &str, x: &ClaudeExtras) -> String {
+    let mut msg = format!("Claude Code 已切换到 {model}");
+    if !x.done.is_empty() {
+        msg += &format!("，同时配置了{}", x.done.join("、"));
+    }
+    if !x.warnings.is_empty() {
+        msg += &format!("。注意：{}", x.warnings.join("；"));
+    }
+    msg
+}
+
 #[tauri::command]
 pub fn import_config(req: ImportRequest) -> R<Vec<ImportResult>> {
     let key = req.key.trim();
@@ -410,14 +697,17 @@ pub fn import_config(req: ImportRequest) -> R<Vec<ImportResult>> {
     }
     let mut out = Vec::new();
     if let Some(m) = clean(&req.claude_model) {
-        let r = import_claude(key, &m);
+        let r = import_claude(key, &m, &req.models);
         if r.is_ok() {
-            let _ = record_history(Target::Claude, key, &m, &[]);
+            let _ = record_history(Target::Claude, key, &m, &req.models);
         }
         out.push(ImportResult {
             target: Target::Claude,
             ok: r.is_ok(),
-            message: r.err().unwrap_or_else(|| format!("Claude Code 已切换到 {m}")),
+            message: match r {
+                Ok(x) => claude_message(&m, &x),
+                Err(e) => e,
+            },
         });
     }
     if let Some(m) = clean(&req.codex_model) {
@@ -511,8 +801,9 @@ pub fn apply_history(target: Target, id: String) -> R<String> {
         .ok_or("这条导入记录已不存在，请重新打开窗口。")?;
     let name = match target {
         Target::Claude => {
-            import_claude(&e.key, &e.model)?;
-            "Claude Code"
+            let x = import_claude(&e.key, &e.model, &e.models)?;
+            let _ = record_history(target, &e.key, &e.model, &e.models);
+            return Ok(claude_message(&e.model, &x).replacen("已切换到", "已切换回", 1));
         }
         Target::Codex => {
             import_codex(&e.key, &e.model, &e.models)?;
@@ -535,6 +826,8 @@ pub struct ClientStatus {
     key_hint: Option<String>,
     has_backup: bool,
     config_path: String,
+    /// Other entry points configured together (Claude: desktop app, VS Code).
+    also: Vec<String>,
 }
 
 fn mask(key: &str) -> String {
@@ -556,6 +849,11 @@ fn claude_status() -> R<ClientStatus> {
         key_hint: if connected { get("ANTHROPIC_AUTH_TOKEN").map(|k| mask(&k)) } else { None },
         has_backup: has_backup(Target::Claude),
         config_path: path.display().to_string(),
+        also: [(desktop_installed(), "Claude 桌面版"), (vscode_installed(), "VS Code 插件")]
+            .into_iter()
+            .filter(|(on, _)| *on)
+            .map(|(_, n)| n.to_string())
+            .collect(),
     })
 }
 
@@ -577,6 +875,7 @@ fn codex_status() -> R<ClientStatus> {
         },
         has_backup: has_backup(Target::Codex),
         config_path: path.display().to_string(),
+        also: vec![],
     })
 }
 
@@ -622,10 +921,19 @@ mod tests {
         let orig_claude = "{\"theme\":\"dark\",\"env\":{\"FOO\":\"1\",\"ANTHROPIC_API_KEY\":\"old\"}}";
         fs::write(tmp.join(".codex/config.toml"), orig_toml).unwrap();
         fs::write(tmp.join(".claude/settings.json"), orig_claude).unwrap();
+        // Claude desktop + VS Code present inside the sandbox home.
+        let (local, roaming) = app_data().unwrap();
+        assert!(local.starts_with(&tmp) && roaming.starts_with(&tmp));
+        let orig_desk = "{\"mcpServers\":{\"a\":{\"command\":\"a\"}}}";
+        fs::create_dir_all(local.join("Claude")).unwrap();
+        fs::write(local.join("Claude/claude_desktop_config.json"), orig_desk).unwrap();
+        let orig_vs = "// mine\n{\n  \"editor.fontSize\": 14, // keep\n}\n";
+        fs::create_dir_all(roaming.join("Code/User")).unwrap();
+        fs::write(roaming.join("Code/User/settings.json"), orig_vs).unwrap();
 
         let res = import_config(ImportRequest {
             key: "sk-test1234".into(),
-            claude_model: Some("gpt-6.1-sol".into()),
+            claude_model: Some("claude-opus-5-5".into()),
             codex_model: Some("claude-opus-5-5".into()),
             models: vec!["gpt-6.1-sol".into(), "claude-opus-5-5".into()],
         })
@@ -645,9 +953,26 @@ mod tests {
         let s: Value = serde_json::from_str(&fs::read_to_string(tmp.join(".claude/settings.json")).unwrap()).unwrap();
         assert_eq!(s["theme"], "dark");
         assert_eq!(s["env"]["FOO"], "1");
-        assert!(s["env"].get("ANTHROPIC_API_KEY").is_none());
+        assert_eq!(s["env"]["ANTHROPIC_API_KEY"], "", "inherited OS key neutralized");
         assert_eq!(s["env"]["ANTHROPIC_AUTH_TOKEN"], "sk-test1234");
-        assert_eq!(s["env"]["ANTHROPIC_DEFAULT_HAIKU_MODEL"], "gpt-6.1-sol");
+        assert_eq!(s["env"]["ANTHROPIC_DEFAULT_HAIKU_MODEL"], "claude-opus-5-5");
+        assert_eq!(s["model"], "claude-opus-5-5");
+        assert_eq!(s["availableModels"][0], "claude-opus-5-5");
+        let msg = &res.iter().find(|r| r.target == Target::Claude).unwrap().message;
+        assert!(msg.contains("Claude 桌面版") && msg.contains("VS Code"), "{msg}");
+        let f = desktop_files().unwrap();
+        let prof: Value = serde_json::from_str(&fs::read_to_string(&f[0]).unwrap()).unwrap();
+        assert_eq!(prof["inferenceGatewayBaseUrl"], CLAUDE_BASE);
+        assert_eq!(prof["inferenceGatewayApiKey"], "sk-test1234");
+        assert_eq!(prof["inferenceModels"], json!(["claude-opus-5-5"]), "GPT ids filtered for desktop");
+        let meta: Value = serde_json::from_str(&fs::read_to_string(&f[1]).unwrap()).unwrap();
+        assert_eq!(meta["appliedId"], DESKTOP_PROFILE_ID);
+        let desk: Value = serde_json::from_str(&fs::read_to_string(&f[3]).unwrap()).unwrap();
+        assert_eq!(desk["deploymentMode"], "3p");
+        assert!(desk["mcpServers"]["a"].is_object(), "desktop MCP kept");
+        let vs = fs::read_to_string(roaming.join("Code/User/settings.json")).unwrap();
+        assert!(vs.contains("// keep") && vs.contains("\"claudeCode.disableLoginPrompt\": true"), "{vs}");
+        assert!(!vs.contains("sk-test"), "key never copied into VS Code settings");
 
         let st = status().unwrap();
         assert!(st.iter().all(|s| s.connected && s.has_backup));
@@ -662,6 +987,9 @@ mod tests {
         assert!(!tmp.join(".codex").join(CATALOG_FILE).exists());
         assert!(!tmp.join(".claude.json").exists());
         assert_eq!(fs::read_to_string(tmp.join(".claude/settings.json")).unwrap(), orig_claude);
+        assert_eq!(fs::read_to_string(&f[3]).unwrap(), orig_desk);
+        assert!(!f[0].exists() && !f[2].exists(), "files XBTry created are removed");
+        assert_eq!(fs::read_to_string(roaming.join("Code/User/settings.json")).unwrap(), orig_vs);
         assert!(restore_config(Target::Codex).is_err());
 
         // History survives a restore and can re-apply an earlier import.
@@ -672,9 +1000,9 @@ mod tests {
         apply_history(Target::Claude, h[1].id.clone()).unwrap();
         let s: Value = serde_json::from_str(&fs::read_to_string(tmp.join(".claude/settings.json")).unwrap()).unwrap();
         assert_eq!(s["env"]["ANTHROPIC_AUTH_TOKEN"], "sk-test1234");
-        assert_eq!(s["env"]["ANTHROPIC_MODEL"], "gpt-6.1-sol");
+        assert_eq!(s["env"]["ANTHROPIC_MODEL"], "claude-opus-5-5");
         assert_eq!(s["theme"], "dark", "re-apply merges, keeps user settings");
-        assert_eq!(list_history(Target::Claude).unwrap()[0].model, "gpt-6.1-sol");
+        assert_eq!(list_history(Target::Claude).unwrap()[0].model, "claude-opus-5-5");
         assert!(has_backup(Target::Claude), "re-apply backs up the original first");
         assert_eq!(list_history(Target::Codex).unwrap()[0].model_count, 2);
         assert!(apply_history(Target::Codex, "nope".into()).is_err());
