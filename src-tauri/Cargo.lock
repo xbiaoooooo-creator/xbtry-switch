@@ -5644,7 +5644,7 @@ dependencies = [
 
 [[package]]
 name = "xbtry"
-version = "2.1.0"
+version = "2.3.0"
 dependencies = [
  "dirs 5.0.1",
  "jsonc-parser",
@@ -5656,6 +5656,8 @@ dependencies = [
  "tauri-plugin-opener",
  "tauri-plugin-single-instance",
  "toml_edit 0.22.27",
+ "windows-sys 0.59.0",
+ "winreg",
 ]
 
 [[package]]

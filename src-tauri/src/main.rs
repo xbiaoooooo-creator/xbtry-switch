@@ -1,6 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod account;
+mod ai;
 mod config;
+mod doctor;
+mod monitor;
 
 use tauri::Manager;
 
@@ -19,7 +23,33 @@ fn main() {
             config::import_config,
             config::restore_config,
             config::list_history,
-            config::apply_history
+            config::apply_history,
+            config::list_providers,
+            config::save_provider,
+            config::delete_provider,
+            doctor::run_checks,
+            doctor::apply_fix,
+            doctor::list_fixes,
+            doctor::undo_fix,
+            doctor::diagnose,
+            doctor::detect_proxy,
+            doctor::claude_version_info,
+            doctor::run_terminal,
+            doctor::check_ip,
+            doctor::find_claude,
+            doctor::launch_claude,
+            monitor::monitor_start,
+            monitor::monitor_stop,
+            monitor::monitor_status,
+            monitor::monitor_interval,
+            account::account_captcha,
+            account::account_send_code,
+            account::account_auth,
+            account::account_me,
+            account::account_logout,
+            account::account_keys,
+            ai::ai_check,
+            ai::ai_zh
         ])
         .run(tauri::generate_context!())
         .expect("failed to start XBTry");
